@@ -641,6 +641,44 @@ func convertInputFields(fields []typing.InputField) []InputFieldResponse {
 	return result
 }
 
+// maskToken redacts the middle of a sensitive token string for safe logging.
+// It preserves the first 10 and last 10 characters, replacing the rest with "...".
+// Tokens 20 characters or shorter are fully masked as "***".
+func maskToken(token string) string {
+	if len(token) <= 20 {
+		return "***"
+	}
+	return token[:10] + "..." + token[len(token)-10:]
+}
+
+// sensitiveHeaders lists request headers that carry credentials and must never
+// be logged in full. Values are redacted via maskToken by sanitizeHeaders.
+var sensitiveHeaders = map[string]struct{}{
+	"Sec-Websocket-Protocol": {}, // carries "access_token.<jwt>" for WebSocket auth
+	"Authorization":          {}, // bearer/basic credentials
+	"Cookie":                 {}, // session cookies
+}
+
+// sanitizeHeaders returns a copy of the given headers safe for logging, with the
+// values of any credential-bearing headers (see sensitiveHeaders) masked. The
+// original header map is never mutated. Header name matching is case-insensitive
+// because http.Header canonicalizes keys (e.g. "Sec-WebSocket-Protocol").
+func sanitizeHeaders(h http.Header) http.Header {
+	sanitized := make(http.Header, len(h))
+	for name, values := range h {
+		if _, sensitive := sensitiveHeaders[http.CanonicalHeaderKey(name)]; sensitive {
+			masked := make([]string, len(values))
+			for i, v := range values {
+				masked[i] = maskToken(v)
+			}
+			sanitized[name] = masked
+			continue
+		}
+		sanitized[name] = values
+	}
+	return sanitized
+}
+
 // writeJSON writes a JSON response with the given status code
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -661,6 +699,9 @@ func writeJSONError(w http.ResponseWriter, status int, err ErrorResponse) {
 // callGetNodesGRPC calls the data provider gRPC service to get nodes
 func (h *Handler) callGetNodesGRPC(kubeconfigBase64 string) ([]string, error) {
 	// Create gRPC connection
+	// NOTE: insecure.NewCredentials() is acceptable here because the gRPC data provider
+	// runs as a sidecar container within the same pod, communicating over localhost.
+	// For cross-node or external gRPC communication, TLS credentials must be used instead.
 	conn, err := grpc.NewClient(
 		h.grpcServerAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -1726,7 +1767,7 @@ func (h *Handler) GetScenarioRunLogs(w http.ResponseWriter, r *http.Request) {
 	// Format: "access_token.<jwt_token>"
 	protocols := r.Header.Get("Sec-WebSocket-Protocol")
 	logger.V(1).Info("📋 Received WebSocket headers",
-		"Sec-WebSocket-Protocol", protocols,
+		"Sec-WebSocket-Protocol", maskToken(protocols),
 		"Sec-WebSocket-Version", r.Header.Get("Sec-WebSocket-Version"),
 		"Sec-WebSocket-Key", r.Header.Get("Sec-WebSocket-Key"))
 
@@ -1734,7 +1775,7 @@ func (h *Handler) GetScenarioRunLogs(w http.ResponseWriter, r *http.Request) {
 		logger.Info("❌ WebSocket authentication failed: missing Sec-WebSocket-Protocol header",
 			"path", r.URL.Path,
 			"client_ip", r.RemoteAddr,
-			"headers", r.Header)
+			"headers", sanitizeHeaders(r.Header))
 		http.Error(w, "Unauthorized: Missing Sec-WebSocket-Protocol header", http.StatusUnauthorized)
 		return
 	}
@@ -1742,7 +1783,7 @@ func (h *Handler) GetScenarioRunLogs(w http.ResponseWriter, r *http.Request) {
 	// Parse protocol: split on first '.' to separate prefix from token
 	// Example: "access_token.eyJhbGc..." → ["access_token", "eyJhbGc..."]
 	logger.V(1).Info("🔍 Parsing Sec-WebSocket-Protocol",
-		"raw_protocol", protocols,
+		"raw_protocol", maskToken(protocols),
 		"protocol_length", len(protocols))
 
 	protocolParts := strings.SplitN(protocols, ".", 2)
@@ -1764,7 +1805,7 @@ func (h *Handler) GetScenarioRunLogs(w http.ResponseWriter, r *http.Request) {
 	if len(protocolParts) != 2 || protocolParts[0] != "access_token" {
 		logger.Info("❌ WebSocket authentication failed: invalid protocol format",
 			"path", r.URL.Path,
-			"protocol", protocols,
+			"protocol", maskToken(protocols),
 			"parts_count", len(protocolParts),
 			"expected_format", "access_token.<jwt>",
 			"client_ip", r.RemoteAddr)
@@ -1781,13 +1822,7 @@ func (h *Handler) GetScenarioRunLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Mask token for logging (show first/last 10 chars)
-	maskedToken := func() string {
-		if len(token) <= 20 {
-			return "***"
-		}
-		return token[:10] + "..." + token[len(token)-10:]
-	}()
+	maskedToken := maskToken(token)
 
 	logger.Info("🔑 JWT token extracted from subprotocol",
 		"token_length", len(token),
@@ -1825,7 +1860,7 @@ func (h *Handler) GetScenarioRunLogs(w http.ResponseWriter, r *http.Request) {
 	// Client sent: "access_token.<jwt_token>"
 	// Server must respond with the SAME value (not just "access_token")
 	logger.Info("⬆️ Upgrading connection to WebSocket",
-		"response_protocol", protocols)
+		"response_protocol", maskToken(protocols))
 
 	conn, err := upgrader.Upgrade(w, r, http.Header{
 		"Sec-WebSocket-Protocol": []string{protocols}, // Echo back the full protocol
@@ -1833,7 +1868,7 @@ func (h *Handler) GetScenarioRunLogs(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logger.Error(err, "❌ WebSocket upgrade failed",
 			"url", r.URL.String(),
-			"headers", r.Header,
+			"headers", sanitizeHeaders(r.Header),
 			"client_ip", r.RemoteAddr)
 		return
 	}
