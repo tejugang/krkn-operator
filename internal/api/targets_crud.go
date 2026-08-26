@@ -27,9 +27,11 @@ import (
 
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	krknv1alpha1 "github.com/krkn-chaos/krkn-operator/api/v1alpha1"
 	"github.com/krkn-chaos/krkn-operator/internal/kubeconfig"
@@ -48,8 +50,8 @@ func (h *Handler) fetchTarget(ctx context.Context, targetUUID string) (*krknv1al
 	}, &target)
 
 	if err != nil {
-		if client.IgnoreNotFound(err) == nil {
-			return nil, fmt.Errorf("target with UUID '%s' not found", targetUUID)
+		if apierrors.IsNotFound(err) {
+			return nil, err
 		}
 		return nil, fmt.Errorf("failed to get target: %w", err)
 	}
@@ -345,7 +347,7 @@ func (h *Handler) GetTarget(w http.ResponseWriter, r *http.Request) {
 
 	target, err := h.fetchTarget(ctx, targetUUID)
 	if err != nil {
-		h.writeTargetFetchError(w, err)
+		h.writeTargetFetchError(w, targetUUID, err)
 		return
 	}
 
@@ -378,7 +380,7 @@ func (h *Handler) UpdateTarget(w http.ResponseWriter, r *http.Request) {
 
 	target, err := h.fetchTarget(ctx, targetUUID)
 	if err != nil {
-		h.writeTargetFetchError(w, err)
+		h.writeTargetFetchError(w, targetUUID, err)
 		return
 	}
 
@@ -465,7 +467,7 @@ func (h *Handler) DeleteTarget(w http.ResponseWriter, r *http.Request) {
 
 	target, err := h.fetchTarget(ctx, targetUUID)
 	if err != nil {
-		h.writeTargetFetchError(w, err)
+		h.writeTargetFetchError(w, targetUUID, err)
 		return
 	}
 
@@ -544,15 +546,29 @@ func (h *Handler) TargetsCRUDRouter(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// writeTargetFetchError writes appropriate error response based on the fetch error.
-func (h *Handler) writeTargetFetchError(w http.ResponseWriter, err error) {
-	statusCode := http.StatusInternalServerError
-	if strings.Contains(err.Error(), "not found") {
-		statusCode = http.StatusNotFound
+// writeTargetFetchError writes an appropriate error response based on the fetch error.
+//
+// For NotFound errors it returns a stable, sanitized message keyed on the target UUID
+// so the API contract does not leak Kubernetes implementation details (resource
+// group/kind carried by the underlying StatusError). The raw error is logged
+// server-side for debuggability. All other errors return a generic 500 while the
+// concrete error is logged.
+func (h *Handler) writeTargetFetchError(w http.ResponseWriter, targetUUID string, err error) {
+	logger := log.Log.WithName("targets")
+
+	if apierrors.IsNotFound(err) {
+		logger.V(1).Info("Target not found", "targetUUID", targetUUID, "error", err.Error())
+		writeJSONError(w, http.StatusNotFound, ErrorResponse{
+			Error:   "not_found",
+			Message: fmt.Sprintf("target with UUID '%s' not found", targetUUID),
+		})
+		return
 	}
-	writeJSONError(w, statusCode, ErrorResponse{
-		Error:   "error",
-		Message: err.Error(),
+
+	logger.Error(err, "Failed to fetch target", "targetUUID", targetUUID)
+	writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
+		Error:   "internal_error",
+		Message: "Failed to fetch target",
 	})
 }
 
