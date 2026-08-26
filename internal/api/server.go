@@ -59,10 +59,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	httpSwagger "github.com/swaggo/http-swagger"
+	"golang.org/x/time/rate"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -70,6 +72,7 @@ import (
 	_ "github.com/krkn-chaos/krkn-operator/internal/api/docs" // Import generated docs
 	v2 "github.com/krkn-chaos/krkn-operator/internal/api/v2"
 	"github.com/krkn-chaos/krkn-operator/pkg/auth"
+	"github.com/krkn-chaos/krkn-operator/pkg/wsorigin"
 )
 
 // Server represents the REST API server
@@ -79,7 +82,30 @@ type Server struct {
 	v2Handler      *v2.Handler
 	authMiddleware *auth.Middleware
 	secretManager  *auth.SecretManager
+	// cancelCleanup stops background goroutines (e.g., rate limiter cleanup).
+	// context.CancelFunc is idempotent, so Shutdown can be called multiple times
+	// safely without panicking.
+	cancelCleanup context.CancelFunc
 }
+
+// TrustedProxyCIDRsEnv is the environment variable used to configure the
+// comma-separated CIDR ranges (or bare IPs) whose forwarding headers
+// (X-Forwarded-For / X-Real-IP) are trusted when deriving the client IP for
+// rate limiting. When unset, forwarding headers are ignored and RemoteAddr is
+// always used, preventing clients from spoofing rate-limit keys.
+const TrustedProxyCIDRsEnv = "TRUSTED_PROXY_CIDRS"
+
+// WebSocketAllowedOriginsEnv is the environment variable used to enable and
+// configure WebSocket Origin enforcement. It takes a comma-separated list of
+// origins (e.g. "https://console.example.com") that are accepted in addition to
+// same-origin requests.
+//
+// Enforcement is opt-in: when unset (the default), all origins are accepted.
+// This is safe because WebSocket auth uses a JWT in the Sec-WebSocket-Protocol
+// subprotocol (not ambient cookies), so cross-site WebSocket hijacking does not
+// apply. Set this only to add same-origin + allow-list enforcement as optional
+// defense-in-depth.
+const WebSocketAllowedOriginsEnv = "WEBSOCKET_ALLOWED_ORIGINS"
 
 // NewServer creates a new API server
 //
@@ -110,18 +136,75 @@ func NewServer(port int, client client.Client, clientset kubernetes.Interface, n
 	}
 	authMw := auth.NewLazyMiddleware(getTokenGen)
 
+	// Set up user active status check: after JWT validation, verify the user account
+	// is still active by looking up the KrknUser CR. Uses a 1-minute TTL cache to
+	// avoid hitting the API server on every request.
+	userChecker := newK8sUserStatusChecker(client, namespace)
+	cachedChecker := auth.NewCachedUserStatusChecker(userChecker, 1*time.Minute)
+	authMw.SetUserStatusChecker(cachedChecker)
+
 	// Create v2 handler (WebSocket support only, REST reuses v1 handlers)
 	getTokenGenCtx := func(ctx context.Context) (*auth.TokenGenerator, error) {
 		return secretManager.GetTokenGenerator()
 	}
 	v2Handler := v2.NewHandler(client, namespace, handler, getTokenGenCtx) // handler implements AuthorizationChecker
 
+	// Strict per-IP rate limiter for the login endpoint only: 5 requests per
+	// minute, burst of 10. Login is the password brute-force surface, so it is
+	// the one endpoint that warrants aggressive limiting.
+	loginRateLimiter := newIPRateLimiter(rate.Every(12*time.Second), 10) // 5 per minute = 1 every 12s
+
+	// Permissive per-IP rate limiter for the other public auth endpoints
+	// (is-registered, register). These carry no password-guessing surface
+	// (is-registered is a global boolean the console polls repeatedly; register
+	// is gated elsewhere), so the limiter here only guards against outright abuse
+	// without interfering with normal frontend use.
+	publicAuthRateLimiter := newIPRateLimiter(rate.Every(time.Second), 30) // 60 per minute, burst 30
+
+	// Trust forwarding headers only from explicitly configured proxies so
+	// clients cannot spoof the rate-limit key. Unset means RemoteAddr is used.
+	if raw := os.Getenv(TrustedProxyCIDRsEnv); raw != "" {
+		cidrs, invalid := parseTrustedProxyCIDRs(raw)
+		loginRateLimiter.setTrustedProxies(cidrs)
+		publicAuthRateLimiter.setTrustedProxies(cidrs)
+		if len(invalid) > 0 {
+			log.Log.WithName("rate-limiter").Info("Ignoring invalid trusted proxy CIDRs",
+				"invalid", invalid, "env", TrustedProxyCIDRsEnv)
+		}
+	}
+
+	// WebSocket Origin enforcement is opt-in. When configured, only same-origin
+	// requests and the listed origins may open WebSocket connections; when unset
+	// (default) all origins are accepted (auth is via a JWT subprotocol, not
+	// ambient cookies, so CSWSH does not apply).
+	if raw := os.Getenv(WebSocketAllowedOriginsEnv); raw != "" {
+		origins := strings.Split(raw, ",")
+		invalid := wsorigin.SetAllowedOrigins(origins)
+		log.Log.WithName("websocket-origin").Info("WebSocket origin enforcement enabled",
+			"allowedOrigins", origins, "env", WebSocketAllowedOriginsEnv)
+		if len(invalid) > 0 {
+			log.Log.WithName("websocket-origin").Info("Ignoring invalid allowed origins",
+				"invalid", invalid, "env", WebSocketAllowedOriginsEnv)
+		}
+	} else {
+		log.Log.WithName("websocket-origin").Info(
+			"WebSocket origin enforcement disabled; all origins allowed (auth is via JWT subprotocol)",
+			"env", WebSocketAllowedOriginsEnv)
+	}
+
+	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
+	loginRateLimiter.startCleanup(cleanupCtx, 10*time.Minute, 10*time.Minute)
+	publicAuthRateLimiter.startCleanup(cleanupCtx, 10*time.Minute, 10*time.Minute)
+	loginRateLimit := rateLimitMiddleware(loginRateLimiter)
+	publicAuthRateLimit := rateLimitMiddleware(publicAuthRateLimiter)
+
 	mux := http.NewServeMux()
 
-	// Public authentication endpoints (no auth required)
-	mux.HandleFunc(AuthIsRegistered, handler.IsRegistered)
-	mux.HandleFunc(AuthRegister, handler.Register)
-	mux.HandleFunc(AuthLogin, handler.Login)
+	// Public authentication endpoints (no auth required). Only login is strictly
+	// limited (brute-force protection); the rest are loosely limited.
+	mux.Handle(AuthIsRegistered, publicAuthRateLimit(http.HandlerFunc(handler.IsRegistered)))
+	mux.Handle(AuthRegister, publicAuthRateLimit(http.HandlerFunc(handler.Register)))
+	mux.Handle(AuthLogin, loginRateLimit(http.HandlerFunc(handler.Login)))
 
 	// Authenticated endpoints - user and admin access
 	mux.Handle(HealthPath, authMw.RequireAuth(http.HandlerFunc(handler.HealthCheck)))
@@ -271,6 +354,7 @@ func NewServer(port int, client client.Client, clientset kubernetes.Interface, n
 		v2Handler:      v2Handler,
 		authMiddleware: authMw,
 		secretManager:  secretManager,
+		cancelCleanup:  cancelCleanup,
 	}
 }
 
@@ -323,8 +407,15 @@ startServer:
 	}
 }
 
-// Shutdown gracefully shuts down the API server
+// Shutdown gracefully shuts down the API server and stops background goroutines.
+// It is safe to call multiple times: context.CancelFunc is idempotent, so
+// repeated or concurrent invocations do not panic.
 func (s *Server) Shutdown() error {
+	// Stop background goroutines (rate limiter cleanup, etc.)
+	if s.cancelCleanup != nil {
+		s.cancelCleanup()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return s.server.Shutdown(ctx)
