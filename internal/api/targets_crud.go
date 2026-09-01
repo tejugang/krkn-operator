@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
@@ -39,6 +40,31 @@ import (
 
 // +kubebuilder:rbac:groups=krkn.krkn-chaos.dev,resources=krknoperatortargets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=krkn.krkn-chaos.dev,resources=krknoperatortargets/status,verbs=get;update;patch
+
+// cleanupTimeout bounds best-effort cleanup deletes. It is intentionally short
+// so a stuck API server cannot block the handler goroutine indefinitely.
+const cleanupTimeout = 10 * time.Second
+
+// deleteQuietly performs a best-effort delete of obj as part of error recovery.
+//
+// It deliberately derives its context from context.WithoutCancel(ctx) so the
+// delete still runs even when the originating request context has already been
+// canceled (client disconnect, proxy timeout, or server deadline). Reusing the
+// canceled request context here would make the delete fail immediately, leaving
+// orphaned Secrets/Targets behind. A NotFound result is treated as success;
+// any other failure is logged (not returned) because the caller is already on
+// an error path and cleanup is opportunistic.
+func (h *Handler) deleteQuietly(ctx context.Context, obj client.Object) {
+	logger := log.FromContext(ctx)
+
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+
+	if err := h.client.Delete(cleanupCtx, obj); client.IgnoreNotFound(err) != nil {
+		logger.Error(err, "Failed to clean up resource during error handling",
+			"kind", fmt.Sprintf("%T", obj), "name", obj.GetName())
+	}
+}
 
 // fetchTarget retrieves a KrknOperatorTarget by UUID.
 // Returns the target and any error encountered.
@@ -149,14 +175,16 @@ func generateKubeconfigFromCredentialsType(req CreateTargetRequest) (string, str
 // CreateTarget handles POST /api/v1/operator/targets
 // Creates a new KrknOperatorTarget CR with a generated UUID and associated Secret
 func (h *Handler) CreateTarget(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
+	ctx := r.Context()
+	logger := log.FromContext(ctx)
 
 	// Parse request body
 	var req CreateTargetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Error(err, "Failed to decode create target request body")
 		writeJSONError(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "bad_request",
-			Message: "Invalid request body: " + err.Error(),
+			Message: "Invalid request body",
 		})
 		return
 	}
@@ -189,9 +217,10 @@ func (h *Handler) CreateTarget(w http.ResponseWriter, r *http.Request) {
 	// Check for duplicate clusterName or clusterAPIURL
 	var existingTargets krknv1alpha1.KrknOperatorTargetList
 	if err := h.client.List(ctx, &existingTargets, client.InNamespace(h.namespace)); err != nil {
+		logger.Error(err, "Failed to check existing targets")
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to check existing targets: " + err.Error(),
+			Message: "Failed to check existing targets",
 		})
 		return
 	}
@@ -221,9 +250,10 @@ func (h *Handler) CreateTarget(w http.ResponseWriter, r *http.Request) {
 	// Create Secret with kubeconfig
 	secretData, err := kubeconfig.MarshalSecretData(kubeconfigBase64)
 	if err != nil {
+		logger.Error(err, "Failed to marshal secret data")
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to marshal secret data: " + err.Error(),
+			Message: "Failed to marshal secret data",
 		})
 		return
 	}
@@ -242,9 +272,10 @@ func (h *Handler) CreateTarget(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.client.Create(ctx, secret); err != nil {
+		logger.Error(err, "Failed to create secret")
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to create secret: " + err.Error(),
+			Message: "Failed to create secret",
 		})
 		return
 	}
@@ -267,12 +298,14 @@ func (h *Handler) CreateTarget(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.client.Create(ctx, target); err != nil {
-		// Cleanup secret on error
-		_ = h.client.Delete(ctx, secret) // Best-effort cleanup
+		// Cleanup secret on error (detached context so it runs even if the
+		// request was canceled)
+		h.deleteQuietly(ctx, secret)
 
+		logger.Error(err, "Failed to create target")
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to create target: " + err.Error(),
+			Message: "Failed to create target",
 		})
 		return
 	}
@@ -283,13 +316,15 @@ func (h *Handler) CreateTarget(w http.ResponseWriter, r *http.Request) {
 		LastUpdated: metav1.Now(),
 	}
 	if err := h.client.Status().Update(ctx, target); err != nil {
-		// Cleanup on error
-		_ = h.client.Delete(ctx, target) // Best-effort cleanup
-		_ = h.client.Delete(ctx, secret) // Best-effort cleanup
+		// Cleanup on error (detached context so it runs even if the request
+		// was canceled)
+		h.deleteQuietly(ctx, target)
+		h.deleteQuietly(ctx, secret)
 
+		logger.Error(err, "Failed to update target status")
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to update target status: " + err.Error(),
+			Message: "Failed to update target status",
 		})
 		return
 	}
@@ -306,14 +341,16 @@ func (h *Handler) CreateTarget(w http.ResponseWriter, r *http.Request) {
 // ListTargets handles GET /api/v1/operator/targets
 // Returns a list of all KrknOperatorTarget CRs
 func (h *Handler) ListTargets(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
+	ctx := r.Context()
+	logger := log.FromContext(ctx)
 
 	// List all targets
 	var targets krknv1alpha1.KrknOperatorTargetList
 	if err := h.client.List(ctx, &targets, client.InNamespace(h.namespace)); err != nil {
+		logger.Error(err, "Failed to list targets")
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to list targets: " + err.Error(),
+			Message: "Failed to list targets",
 		})
 		return
 	}
@@ -334,7 +371,7 @@ func (h *Handler) ListTargets(w http.ResponseWriter, r *http.Request) {
 // GetTarget handles GET /api/v1/operator/targets/{uuid}
 // Returns a single KrknOperatorTarget by UUID
 func (h *Handler) GetTarget(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
+	ctx := r.Context()
 
 	targetUUID, err := extractPathSuffix(r.URL.Path, OperatorTargetsPath+"/")
 	if err != nil {
@@ -358,7 +395,8 @@ func (h *Handler) GetTarget(w http.ResponseWriter, r *http.Request) {
 // UpdateTarget handles PUT /api/v1/operator/targets/{uuid}
 // Updates an existing KrknOperatorTarget (overwrites the Secret kubeconfig)
 func (h *Handler) UpdateTarget(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
+	ctx := r.Context()
+	logger := log.FromContext(ctx)
 
 	targetUUID, err := extractPathSuffix(r.URL.Path, OperatorTargetsPath+"/")
 	if err != nil {
@@ -371,9 +409,10 @@ func (h *Handler) UpdateTarget(w http.ResponseWriter, r *http.Request) {
 
 	var req UpdateTargetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Error(err, "Failed to decode update target request body")
 		writeJSONError(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "bad_request",
-			Message: "Invalid request body: " + err.Error(),
+			Message: "Invalid request body",
 		})
 		return
 	}
@@ -399,18 +438,20 @@ func (h *Handler) UpdateTarget(w http.ResponseWriter, r *http.Request) {
 		Name:      target.Spec.SecretUUID,
 		Namespace: h.namespace,
 	}, &secret); err != nil {
+		logger.Error(err, "Failed to get secret", "secretUUID", target.Spec.SecretUUID)
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to get secret: " + err.Error(),
+			Message: "Failed to get secret",
 		})
 		return
 	}
 
 	secretData, err := kubeconfig.MarshalSecretData(kubeconfigBase64)
 	if err != nil {
+		logger.Error(err, "Failed to marshal secret data")
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to marshal secret data: " + err.Error(),
+			Message: "Failed to marshal secret data",
 		})
 		return
 	}
@@ -418,9 +459,10 @@ func (h *Handler) UpdateTarget(w http.ResponseWriter, r *http.Request) {
 	secret.Data["kubeconfig"] = secretData
 
 	if err := h.client.Update(ctx, &secret); err != nil {
+		logger.Error(err, "Failed to update secret", "secretUUID", target.Spec.SecretUUID)
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to update secret: " + err.Error(),
+			Message: "Failed to update secret",
 		})
 		return
 	}
@@ -436,9 +478,10 @@ func (h *Handler) UpdateTarget(w http.ResponseWriter, r *http.Request) {
 	target.Status.LastUpdated = metav1.Now()
 
 	if err := h.client.Update(ctx, target); err != nil {
+		logger.Error(err, "Failed to update target", "targetUUID", targetUUID)
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to update target: " + err.Error(),
+			Message: "Failed to update target",
 		})
 		return
 	}
@@ -454,7 +497,8 @@ func (h *Handler) UpdateTarget(w http.ResponseWriter, r *http.Request) {
 // DeleteTarget handles DELETE /api/v1/operator/targets/{uuid}
 // Deletes a KrknOperatorTarget and its associated Secret
 func (h *Handler) DeleteTarget(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
+	ctx := r.Context()
+	logger := log.FromContext(ctx)
 
 	targetUUID, err := extractPathSuffix(r.URL.Path, OperatorTargetsPath+"/")
 	if err != nil {
@@ -478,13 +522,15 @@ func (h *Handler) DeleteTarget(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Best-effort cleanup of secret (ignore if not found)
-	_ = h.client.Delete(ctx, secret)
+	// Best-effort cleanup of secret (ignore if not found); detached context so
+	// the secret is not orphaned if the request is canceled after this point
+	h.deleteQuietly(ctx, secret)
 
 	if err := h.client.Delete(ctx, target); err != nil {
+		logger.Error(err, "Failed to delete target", "targetUUID", targetUUID)
 		writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Failed to delete target: " + err.Error(),
+			Message: "Failed to delete target",
 		})
 		return
 	}
