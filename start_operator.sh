@@ -62,6 +62,79 @@ install_crds() {
     fi
 }
 
+# Function to create service account and RBAC
+create_service_account() {
+    print_info "Creating service account and RBAC..."
+
+    # Ensure namespace exists
+    if ! kubectl get namespace "${KRKN_NAMESPACE}" &> /dev/null; then
+        print_info "Creating namespace ${KRKN_NAMESPACE}..."
+        kubectl create namespace "${KRKN_NAMESPACE}" || {
+            print_error "Failed to create namespace ${KRKN_NAMESPACE}"
+            return 1
+        }
+    fi
+
+    # Create service account in the target namespace
+    kubectl create serviceaccount krkn-operator-krkn-scenario-runner \
+        -n "${KRKN_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+    # Create least-privilege ClusterRole (matching Helm chart)
+    kubectl apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: krkn-operator-scenario-runner
+rules:
+- apiGroups: [""]
+  resources: [nodes, pods, services, namespaces]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [pods, pods/log, pods/exec]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [""]
+  resources: [nodes]
+  verbs: [get, list, patch, update]
+EOF
+
+    # Create namespace-qualified ClusterRoleBinding to avoid collisions
+    kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: krkn-operator-${KRKN_NAMESPACE}-scenario-runner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: krkn-operator-scenario-runner
+subjects:
+- kind: ServiceAccount
+  name: krkn-operator-krkn-scenario-runner
+  namespace: ${KRKN_NAMESPACE}
+EOF
+
+    # Handle OpenShift: grant anyuid SCC if available
+    if timeout 5 kubectl api-resources 2>/dev/null | grep -q "securitycontextconstraints"; then
+        print_info "OpenShift detected, granting anyuid SCC..."
+        kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: krkn-operator-${KRKN_NAMESPACE}-scenario-runner-anyuid
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+subjects:
+- kind: ServiceAccount
+  name: krkn-operator-krkn-scenario-runner
+  namespace: ${KRKN_NAMESPACE}
+EOF
+    fi
+
+    print_info "Service account and RBAC created successfully"
+}
+
 # Function to build the operator
 build_operator() {
     if [ "$BUILD" = "true" ]; then
@@ -115,6 +188,7 @@ main() {
 
     check_prerequisites
     install_crds
+    create_service_account
     build_operator
     run_operator
 }
