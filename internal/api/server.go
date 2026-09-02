@@ -338,10 +338,12 @@ func NewServer(port int, client client.Client, clientset kubernetes.Interface, n
 		http.NotFound(w, r)
 	})
 
-	// Wrap mux with logging middleware
+	// Wrap mux with middleware chain: logging -> body size limit -> routes
+	// maxBodySize is 10MB, applied only to POST/PUT/PATCH requests
+	const maxBodySize int64 = 10 << 20 // 10 MB
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           loggingMiddleware(mux),
+		Handler:           loggingMiddleware(maxBodySizeMiddleware(maxBodySize)(mux)),
 		ReadHeaderTimeout: 30 * time.Second,  // Prevent Slowloris attacks
 		ReadTimeout:       60 * time.Second,  // Total request read timeout
 		WriteTimeout:      60 * time.Second,  // Response write timeout
@@ -423,6 +425,43 @@ func (s *Server) Shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return s.server.Shutdown(ctx)
+}
+
+// maxBodySizeMiddleware returns middleware that limits request body size for
+// POST, PUT, and PATCH methods. This prevents clients from sending excessively
+// large payloads that could exhaust memory. GET, DELETE, and other methods are
+// passed through without modification.
+//
+// Enforcement happens in two layers so that a payload-too-large is reported
+// consistently as 413 Request Entity Too Large (with a JSON body) rather than
+// being misclassified downstream as a generic 400 "invalid request body":
+//
+//  1. When the client advertises a Content-Length larger than the limit, the
+//     request is rejected immediately with a 413 before the body is read. This
+//     covers virtually all real clients, which send Content-Length for JSON
+//     payloads.
+//  2. For chunked / unknown-length requests (Content-Length <= 0) the body is
+//     wrapped with http.MaxBytesReader, which caps memory usage. Reads past the
+//     limit fail with *http.MaxBytesError; handlers surface that as a decode
+//     error. Memory is always protected in this case.
+func maxBodySizeMiddleware(maxBytes int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+				// Fast path: reject when the declared size already exceeds the
+				// limit, returning a precise 413 without reading the body.
+				if r.ContentLength > maxBytes {
+					writeJSONError(w, http.StatusRequestEntityTooLarge, ErrorResponse{
+						Error:   "request_entity_too_large",
+						Message: "Request body too large",
+					})
+					return
+				}
+				r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // loggingMiddleware is a logging middleware for HTTP requests.
