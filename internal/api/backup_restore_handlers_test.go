@@ -27,6 +27,9 @@ import (
 	"testing"
 
 	"github.com/krkn-chaos/krkn-operator/pkg/auth"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -468,5 +471,19 @@ func createMultipartBody(t *testing.T, fieldName, filename string, content []byt
 // createTestHandler creates a handler with a fake K8s client for testing.
 func createTestHandler() *Handler {
 	fakeClient := fake.NewClientBuilder().Build()
-	return NewHandler(fakeClient, nil, "default", "", &auth.SecretManager{})
+	dynamicClient := newTestDynamicClient()
+	return NewHandler(fakeClient, nil, "default", "", &auth.SecretManager{}, dynamicClient)
+}
+
+func newTestDynamicClient() *dynamicfake.FakeDynamicClient {
+	scheme := runtime.NewScheme()
+	listKinds := map[schema.GroupVersionResource]string{
+		{Group: "krkn.krkn-chaos.dev", Version: "v1alpha1", Resource: "krknusers"}:                   "KrknUserList",
+		{Group: "krkn.krkn-chaos.dev", Version: "v1alpha1", Resource: "krknusergroups"}:              "KrknUserGroupList",
+		{Group: "krkn.krkn-chaos.dev", Version: "v1alpha1", Resource: "krknoperatortargets"}:         "KrknOperatorTargetList",
+		{Group: "krkn.krkn-chaos.dev", Version: "v1alpha1", Resource: "krknoperatortargetproviders"}: "KrknOperatorTargetProviderList",
+		{Group: "", Version: "v1", Resource: "secrets"}:                                              "SecretList",
+		{Group: "", Version: "v1", Resource: "configmaps"}:                                           "ConfigMapList",
+	}
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds)
 }
